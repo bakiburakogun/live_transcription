@@ -11,7 +11,7 @@ from typing import Literal
 
 import niquests
 from atranslator import ATranslator
-from constants import OCP_TASK_PROC_SCHED_RETRIES
+from constants import OCP_TASK_GIVEUP_MARGIN, OCP_TASK_PROC_SCHED_RETRIES, OCP_TASK_TIMEOUT
 from livetypes import LanguageModel, SupportedTranslationLanguages, TranslateException, TranslateFatalException
 from models import LANGUAGE_MAP
 from nc_py_api import AsyncNextcloudApp, NextcloudException
@@ -98,6 +98,22 @@ class OCPTranslator(ATranslator):
 
 	async def translate(self, message: str) -> str:  # noqa: C901
 		nc = AsyncNextcloudApp()
+		loop = asyncio.get_running_loop()
+		started_at = loop.time()
+		# Stop before the caller's asyncio.wait_for(..., OCP_TASK_TIMEOUT) cancels this
+		# coroutine, otherwise none of the errors raised below ever reach the logs.
+		deadline = started_at + max(1, OCP_TASK_TIMEOUT - OCP_TASK_GIVEUP_MARGIN)
+
+		async def sleep_within_budget(seconds: float) -> bool:
+			"""Sleep for at most ``seconds``, never past the deadline.
+
+			Returns False when the budget is already spent.
+			"""
+			remaining = deadline - loop.time()
+			if remaining <= 0:
+				return False
+			await asyncio.sleep(min(seconds, remaining))
+			return True
 
 		sched_tries = OCP_TASK_PROC_SCHED_RETRIES
 		while True:
@@ -141,7 +157,11 @@ class OCPTranslator(ATranslator):
 							"tag": "translate",
 						},
 					)
-					await asyncio.sleep(30)
+					if not await sleep_within_budget(30):
+						raise TranslateException(
+							"Rate limited while scheduling the TaskProcessing translation task and the "
+							f"{OCP_TASK_TIMEOUT}s budget is spent",
+						) from e
 					continue
 
 				if e.status_code // 100 == 4:
@@ -175,17 +195,17 @@ class OCPTranslator(ATranslator):
 			wait_time = 2
 			now_waiting_for = 0
 
-			# wait for 2 minutes, which is already quite long for a live translation task
-			while task.status != "STATUS_SUCCESSFUL" and task.status != "STATUS_FAILED" and now_waiting_for < 120:
+			while task.status != "STATUS_SUCCESSFUL" and task.status != "STATUS_FAILED":
 				i += 1
-				if now_waiting_for < 60:
+				if now_waiting_for < (deadline - started_at) / 2:
 					wait_time = min(wait_time**i, 5) # 1,2,4,5,5,5,5,5,...
-					now_waiting_for += wait_time
-					await asyncio.sleep(wait_time)
+					sleep_for = wait_time
 				else:
-					# poll every 10 secs in the second half
-					now_waiting_for += 10
-					await asyncio.sleep(10)
+					# poll less often in the second half of the budget
+					sleep_for = 10
+				if not await sleep_within_budget(sleep_for):
+					break
+				now_waiting_for = round(loop.time() - started_at, 1)
 
 				try:
 					response = await nc.ocs("GET", f"/ocs/v1.php/taskprocessing/tasks_consumer/task/{task.id}")
@@ -201,8 +221,9 @@ class OCPTranslator(ATranslator):
 								"tag": "translate",
 							},
 						)
-						now_waiting_for += 10
-						await asyncio.sleep(10)
+						if not await sleep_within_budget(10):
+							break
+						now_waiting_for = round(loop.time() - started_at, 1)
 						continue
 					raise TranslateException("Failed to poll TaskProcessing translation task") from e
 				except niquests.RequestException as e:
@@ -213,12 +234,13 @@ class OCPTranslator(ATranslator):
 						"waiting_time": now_waiting_for,
 						"tag": "translate",
 					})
-					now_waiting_for += 5
-					await asyncio.sleep(5)
+					if not await sleep_within_budget(5):
+						break
+					now_waiting_for = round(loop.time() - started_at, 1)
 					continue
 
 				task = TaskResponse.model_validate(response).task
-				LOGGER.debug(f"Translation task poll ({i * 5}s) response", extra={  # noqa: G004
+				LOGGER.debug(f"Translation task poll after {now_waiting_for}s", extra={  # noqa: G004
 					"origin_language": self.origin_language,
 					"target_language": self.target_language,
 					"tries_so_far": i,
